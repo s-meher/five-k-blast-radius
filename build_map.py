@@ -1,0 +1,241 @@
+"""Build-time: merge coverage dumps into one compact map.
+
+Output (marshal):
+  tests   list of test ids; a test's bit in every mask is its index here
+  lines   {file: {line: mask}}  tests that ran this line (outside module/class bodies)
+  opens   {file: mask}          tests that opened this file as data
+  byfile  {test file: mask}     tests defined in each test file
+"""
+import glob
+import json
+import marshal
+import sys
+from collections import defaultdict
+
+
+def import_graph(root):
+    """repo .py file -> repo .py files it imports (directly), for sqlglot/ and tests/."""
+    import ast
+    import os
+    graph = {}
+
+    def resolve(mod):
+        base = mod.replace(".", "/")
+        for cand in (base + ".py", base + "/__init__.py"):
+            if os.path.isfile(os.path.join(root, cand)):
+                return cand
+        return None
+
+    for top in ("sqlglot", "tests"):
+        for dp, _, fs in os.walk(os.path.join(root, top)):
+            for f in fs:
+                if not f.endswith(".py"):
+                    continue
+                path = os.path.relpath(os.path.join(dp, f), root)
+                try:
+                    tree = ast.parse(open(os.path.join(root, path), "rb").read())
+                except SyntaxError:
+                    continue
+                pkg = path[:-3].replace("/", ".")
+                pkg_parts = pkg.split(".")
+                if f != "__init__.py":
+                    pkg_parts = pkg_parts[:-1]
+                else:
+                    pkg_parts = pkg_parts[:-1]
+                deps = set()
+                for n in ast.walk(tree):
+                    mods = []
+                    if isinstance(n, ast.ImportFrom):
+                        if n.level:
+                            base_parts = pkg_parts[: len(pkg_parts) - (n.level - 1)] if n.level > 1 else pkg_parts
+                            base = ".".join(base_parts + ([n.module] if n.module else []))
+                        else:
+                            base = n.module or ""
+                        mods = [base] + [f"{base}.{a.name}" for a in n.names]
+                    elif isinstance(n, ast.Import):
+                        mods = [a.name for a in n.names]
+                        # "import a.b.c" also runs a and a.b
+                        for a in n.names:
+                            parts = a.name.split(".")
+                            mods += [".".join(parts[:i]) for i in range(1, len(parts))]
+                    for m in mods:
+                        r = resolve(m) if m else None
+                        if r and r != path:
+                            deps.add(r)
+                        # importing a.b.c also runs package __init__ files
+                        if m:
+                            parts = m.split(".")
+                            for i in range(1, len(parts)):
+                                r2 = resolve(".".join(parts[:i]))
+                                if r2 and r2 != path:
+                                    deps.add(r2)
+                graph[path] = deps
+    return graph
+
+
+def eager_modules(root):
+    import subprocess
+    code = ("import sys, sqlglot, os\n"
+            "r = os.path.realpath(sys.argv[1])\n"
+            "for m in list(sys.modules.values()):\n"
+            "    f = getattr(m, '__file__', None) or ''\n"
+            "    f = os.path.realpath(f)\n"
+            "    if f.startswith(r): print(os.path.relpath(f, r))\n")
+    r = subprocess.run([sys.executable, "-c", code, root], capture_output=True, text=True,
+                       env={**__import__("os").environ, "PYTHONPATH": root})
+    return set(r.stdout.split())
+
+
+def main(cov_dir, out_path, root):
+    hits = defaultdict(lambda: defaultdict(set))   # key -> file -> lines
+    opens = defaultdict(set)                       # key -> files
+    inst = defaultdict(set)                        # key -> class names
+    for path in glob.glob(f"{cov_dir}/cov-*.json"):
+        with open(path) as fh:
+            d = json.load(fh)
+        for k, files in d["hits"].items():
+            for f, ls in files.items():
+                hits[k][f].update(ls)
+        for k, fs in d["opens"].items():
+            opens[k].update(fs)
+        for k, cs in d.get("inst", {}).items():
+            inst[k].update(cs)
+
+    tests = sorted(k[len("call::"):] for k in hits.keys() | opens.keys() if k.startswith("call::"))
+    # tests whose call phase hit nothing still exist; take ids from setup too
+    tests = sorted(set(tests) | {k[len("setup::"):] for k in hits.keys() | opens.keys() if k.startswith("setup::")})
+    index = {t: i for i, t in enumerate(tests)}
+
+    def group(t):          # class (or module) a test belongs to
+        return t.rsplit("::", 1)[0]
+
+    def tfile(t):
+        return t.split("::", 1)[0]
+
+    byfile = defaultdict(int)
+    bygroup = defaultdict(int)
+    for t, i in index.items():
+        byfile[tfile(t)] |= 1 << i
+        bygroup[group(t)] |= 1 << i
+
+    graph = import_graph(root)
+    closure = {}
+
+    def deps(f, seen=None):
+        if f in closure:
+            return closure[f]
+        seen = seen or set()
+        out = {f}
+        for d in graph.get(f, ()):
+            if d not in seen:
+                seen.add(d)
+                out |= deps(d, seen)
+        closure[f] = out
+        return out
+
+    importers = defaultdict(set)      # repo file -> repo files importing it (transitively), itself included
+    for tf in graph:
+        for d in deps(tf):
+            importers[d].add(tf)
+    deferred = []
+
+    lines = defaultdict(lambda: defaultdict(int))
+    fopens = defaultdict(int)
+    classes = defaultdict(int)
+
+    def add(mask, files_lines, files_opened, made=()):
+        for c in made:
+            classes[c] |= mask
+        for f, ls in files_lines.items():
+            d = lines[f]
+            for ln in ls:
+                d[ln] |= mask
+        for f in files_opened:
+            fopens[f] |= mask
+
+    for k in hits.keys() | opens.keys() | inst.keys():
+        phase, _, name = k.partition("::")
+        if phase == "call" and name in index:
+            mask = 1 << index[name]
+        elif phase in ("setup", "teardown") and name in index:
+            # class setup/teardown runs inside the first/last test's phases,
+            # but every test in the class depends on it
+            mask = bygroup[group(name)]
+        elif phase == "collect":
+            mask = 0
+            for tf in importers.get(name, {name}):
+                mask |= byfile.get(tf, 0)
+        elif phase == "import":
+            deferred.append(k)
+            continue
+        else:
+            continue
+        if mask:
+            add(mask, hits.get(k, {}), opens.get(k, ()), inst.get(k, ()))
+
+    if len(tests) < 1000 or len(lines) < 100:
+        sys.exit(f"coverage map looks broken: {len(tests)} tests, {len(lines)} files")
+    # Code that ran while a sqlglot module was being imported (metaclasses,
+    # module-level calls) matters to every test that loads that module.
+    eager = eager_modules(root)
+    everyone = (1 << len(tests)) - 1
+    def module_users(f):
+        """Tests that use module file f at run time: ran its lines or made its classes."""
+        m = 0
+        for v in lines.get(f, {}).values():
+            m |= v
+        modname = f[:-3].replace("/", ".")
+        if modname.endswith(".__init__"):
+            modname = modname[: -len(".__init__")]
+        for c, v in classes.items():
+            if c.startswith(modname + "."):
+                m |= v
+        return m
+
+    import_mask = {}
+
+    def mask_for_import(mod_file):
+        if mod_file in import_mask:
+            return import_mask[mod_file]
+        if mod_file in eager:
+            m = everyone
+        else:
+            m = 0
+            for x in importers.get(mod_file, {mod_file}):
+                m |= byfile.get(x, 0) | module_users(x)
+            if not m:
+                m = everyone
+        import_mask[mod_file] = m
+        return m
+
+    for k in deferred:
+        mask = mask_for_import(k.split("::", 1)[1])
+        add(mask, hits.get(k, {}), opens.get(k, ()), inst.get(k, ()))
+    print(f"eager modules: {len(eager)}, import contexts: {len(deferred)}", file=sys.stderr)
+
+    # many lines share a mask: store each mask once and point at it
+    table, ids = [], {}
+
+    def ref(mask):
+        i = ids.get(mask)
+        if i is None:
+            i = ids[mask] = len(table)
+            table.append(mask)
+        return i
+
+    out = {
+        "tests": tests,
+        "masks": None,
+        "lines": {f: {ln: ref(v) for ln, v in d.items()} for f, d in lines.items()},
+        "opens": dict(fopens),
+        "byfile": dict(byfile),
+        "classes": dict(classes),
+    }
+    out["masks"] = table
+    with open(out_path, "wb") as fh:
+        marshal.dump(out, fh)
+    print(f"map: {len(tests)} tests, {len(out['lines'])} files, {len(fopens)} opened files, {len(classes)} classes", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
