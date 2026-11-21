@@ -22,21 +22,29 @@ COV=/tmp/cov
 rm -rf "$COV"
 export SKIP_INTEGRATION=0 COV_ROOT="$APP/src" COV_OUT_DIR="$COV" PYTHONPATH="$APP/src:$APP" PYTHONDONTWRITEBYTECODE=1
 
-# four groups, run side by side (the build has 4 cores)
+# five groups of similar cost, run side by side (the build has 4 cores)
 ALL=$(find tests -name 'test_*.py' | sort)
-G1="tests/test_executor.py"
-G2="tests/test_parser.py"
-G3="tests/test_optimizer.py"
-G4=$(echo "$ALL" | grep -v -e '^tests/test_executor.py$' -e '^tests/test_parser.py$' -e '^tests/test_optimizer.py$' | tr '\n' ' ')
+REST=$(echo "$ALL" | grep -v -e '^tests/test_executor.py$' -e '^tests/test_parser.py$' -e '^tests/test_optimizer.py$')
+# split the remaining files into two halves by size
+HALF_A=$(for f in $REST; do echo "$(wc -c < $f) $f"; done | sort -rn | awk 'NR%2==1 {print $2}' | tr '\n' ' ')
+HALF_B=$(for f in $REST; do echo "$(wc -c < $f) $f"; done | sort -rn | awk 'NR%2==0 {print $2}' | tr '\n' ' ')
 pids=""
-for g in "$G1" "$G2" "$G3" "$G4"; do
-  python -m pytest -q -p covplugin -p no:cacheprovider $g > /tmp/pytest-$(echo "$g" | cut -c1-20 | tr '/ ' '__').log 2>&1 &
+i=0
+for g in "tests/test_executor.py" "tests/test_parser.py" "tests/test_optimizer.py" "$HALF_A" "$HALF_B"; do
+  i=$((i+1))
+  python -m pytest -q -p covplugin -p no:cacheprovider $g > /tmp/pytest-group$i.log 2>&1 &
   pids="$pids $!"
 done
-for p in $pids; do wait "$p" || true; done
+fail=0
+for p in $pids; do
+  rc=0; wait "$p" || rc=$?
+  # 0: all passed, 1: some tests failed (fine for a map); anything else means pytest broke
+  if [ "$rc" -gt 1 ]; then echo "test group exited with $rc"; fail=1; fi
+done
+if [ "$fail" -ne 0 ]; then tail -n 20 /tmp/pytest-group*.log; exit 1; fi
 tail -n 2 /tmp/pytest-*.log || true
 
-python "$APP/build_map.py" "$COV" "$APP/map.marshal" "$APP/src"
+python "$APP/build_map.py" "$COV" "$APP/map.marshal" "$APP/src" "$i"
 rm -rf "$COV"
 find "$APP/src" -name '__pycache__' -prune -exec rm -rf {} +
 chmod -R a+rX "$APP"

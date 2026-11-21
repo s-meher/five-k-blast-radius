@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -147,6 +148,76 @@ def apply_hunks(old_text, fp):
 # --------------------------------------------------------------------------
 # syntax helpers
 
+def hunk_regions(fp):
+    """For each hunk: (old_first, old_last, new_first, new_last) of the lines
+    it changes, or None for a hunk that only inserts or only deletes."""
+    out = []
+    for old_start, new_start, body in fp.hunks:
+        start = max(old_start - 1, 0) if any(b[:1] in " -" for b in body) else old_start
+        o, n = start + 1, new_start
+        rem, add = [], []
+        for b in body:
+            tag = b[:1]
+            if tag == " ":
+                o += 1
+                n += 1
+            elif tag == "-":
+                rem.append(o)
+                o += 1
+            elif tag == "+":
+                add.append(n)
+                n += 1
+        if not rem or not add:
+            out.append(None)
+        else:
+            out.append((min(rem), max(rem), min(add), max(add)))
+    return out
+
+
+def innermost_stmt(tree, first, last):
+    """Deepest statement whose lines cover [first, last]."""
+    best = None
+    stmts = tree.body
+    while True:
+        nxt = None
+        for st in stmts:
+            lo = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+            if lo <= first and st.end_lineno >= last:
+                nxt = st
+                break
+        if nxt is None:
+            return best
+        best = nxt
+        stmts = []
+        for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+            block = getattr(nxt, field, None)
+            if isinstance(block, list):
+                for b in block:
+                    if isinstance(b, (ast.excepthandler, ast.match_case)):
+                        stmts.extend(b.body)
+                    elif isinstance(b, ast.stmt):
+                        stmts.append(b)
+
+
+def local_pairs(fp, old_tree, new_tree):
+    """Pairs of (old statement, new statement) that hold every change, when
+    each hunk replaces lines inside one statement; None otherwise. Everything
+    outside these statements is identical text, so comparing them is enough."""
+    pairs = []
+    for reg in hunk_regions(fp):
+        if reg is None:
+            return None
+        of, ol, nf, nl = reg
+        a = innermost_stmt(old_tree, of, ol)
+        b = innermost_stmt(new_tree, nf, nl)
+        if a is None or b is None or type(a) is not type(b):
+            return None
+        if a.lineno - of != b.lineno - nf:     # must start at the same place
+            return None
+        pairs.append((a, b))
+    return pairs
+
+
 def ast_dump(tree):
     return ast.dump(tree, include_attributes=False)
 
@@ -206,6 +277,25 @@ def locate(tree, line):
     return visit(tree.body, "", False)
 
 
+def top_function(tree, line):
+    """The outermost def holding `line` in its body, reached only through
+    classes: (qualname, node), or None."""
+    def visit(stmts, qual):
+        for s in stmts:
+            first = min([s.lineno] + [d.lineno for d in getattr(s, "decorator_list", [])])
+            if not (first <= line <= s.end_lineno):
+                continue
+            if isinstance(s, ast.ClassDef):
+                return visit(s.body, f"{qual}{s.name}.")
+            if isinstance(s, FUNCS):
+                if line >= s.body[0].lineno:
+                    return (f"{qual}{s.name}", s)
+                return None
+            return None
+        return None
+    return visit(tree.body, "")
+
+
 def bound_names(stmt):
     names = set()
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -258,6 +348,10 @@ class Selector:
         self.opens = m["opens"]
         self.byfile = m["byfile"]
         self.classes = m.get("classes", {})
+        self.importtime = m.get("importtime", {})
+        self.probes = m.get("probes", {})
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.id_of = {t["number"]: t["id"] for t in tests}
         self.tests = tests
         # map bit -> test number; tests unknown to the map are always run
         by_id = {t["id"]: t["number"] for t in tests}
@@ -275,6 +369,16 @@ class Selector:
             p = SRC / path
             self._src[path] = p.read_text(encoding="utf-8") if p.is_file() else None
         return self._src[path]
+
+    def old_tree(self, path):
+        cache = self.__dict__.setdefault("_trees", {})
+        if path not in cache:
+            text = self.src(path)
+            try:
+                cache[path] = ast.parse(text) if text is not None else None
+            except SyntaxError:
+                cache[path] = None
+        return cache[path]
 
     def mask_to_numbers(self, mask):
         out = set()
@@ -357,9 +461,8 @@ class Selector:
             module = path[:-3].replace("/", ".")
             if module.endswith(".__init__"):
                 module = module[: -len(".__init__")]
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
+            tree = self.old_tree(path)
+            if tree is None:
                 continue
             for i, line in enumerate(text.split("\n"), 1):
                 if rx.search(line):
@@ -395,9 +498,8 @@ class Selector:
                 if not rx.search(line):
                     continue
                 if tree is None:
-                    try:
-                        tree = ast.parse(text)
-                    except SyntaxError:
+                    tree = self.old_tree(path)
+                    if tree is None:
                         break
                 loc = locate(tree, i)
                 if not (loc and loc[0] == "def" and loc[2]):
@@ -419,9 +521,8 @@ class Selector:
         text = self.src(path)
         if not text:
             return set()
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
+        tree = self.old_tree(path)
+        if tree is None:
             return set()
         found = set(names)
         changed = True
@@ -441,29 +542,61 @@ class Selector:
     def python_change(self, fp, old_text, notes):
         """Returns (mask, needs_import_check)."""
         new_text, removed, neighbours, added = apply_hunks(old_text, fp)
-        try:
-            old_tree = ast.parse(old_text)
-        except SyntaxError:
+        old_tree = self.old_tree(fp.old)
+        if old_tree is None:
             return None, False
         try:
             new_tree = ast.parse(new_text)
         except SyntaxError:
             notes.append("syntax error")
             return None, False
-        if ast_dump(old_tree) == ast_dump(new_tree):
+        self._plan_swap = None
+        pairs = local_pairs(fp, old_tree, new_tree)
+        if pairs is not None:
+            same = all(ast_dump(a) == ast_dump(b) for a, b in pairs)
+        else:
+            same = ast_dump(old_tree) == ast_dump(new_tree)
+        if same:
             notes.append("same ast")
+            return 0, False
+        if self.equivalent_comparisons(fp.old, old_tree, new_tree, pairs):
+            notes.append("same ast")   # same results at every comparison the suite runs
+            notes.append("equivalent comparison")
             return 0, False
 
         path = fp.old
         mask = 0
         import_check = False
+        swap = set()          # qualnames of top-level functions to swap
+        elig = path.startswith("sqlglot/")
+        imp = set(self.importtime.get(path, ()))
+
+        def body_ok(tree, ln, from_old):
+            nonlocal elig
+            tf = top_function(tree, ln)
+            if tf is None:
+                elig = False
+                return
+            qual, node = tf
+            if from_old:
+                old_node = node
+            else:
+                old_node = self._old_function(old_tree, qual.rsplit(".", 1)[0] if "." in qual else "", node)
+                if old_node is None or old_node.name != node.name:
+                    elig = False
+                    return
+            if any(old_node.lineno <= x <= old_node.end_lineno for x in imp):
+                elig = False
+                return
+            swap.add(qual)
 
         module = path[:-3].replace("/", ".")
         if module.endswith(".__init__"):
             module = module[: -len(".__init__")]
 
         def def_level(stmt, qual, tree_is_old):
-            nonlocal mask, import_check
+            nonlocal mask, import_check, elig
+            elig = False
             if not self._constants_only(stmt, old_tree if not tree_is_old else new_tree):
                 import_check = True
             names = bound_names(stmt)
@@ -519,12 +652,14 @@ class Selector:
                 continue
             kind, stmt, qual = loc
             if kind == "body":
+                body_ok(old_tree, ln, True)
                 first = stmt.lineno
                 last = stmt.end_lineno
                 if hasattr(stmt, "body") and isinstance(stmt.body, list) and stmt.body and not isinstance(stmt, FUNCS):
                     last = stmt.body[0].lineno - 1
                 mask |= self.range_mask(path, first, max(first, last)) | self.lines_mask(path, [ln])
             elif kind == "lambda":
+                elig = False
                 mask |= self.lines_mask(path, [ln])
                 if not self._only_lambdas_changed(stmt, new_tree):
                     def_level(stmt, qual, True)
@@ -538,6 +673,7 @@ class Selector:
                 continue
             kind, stmt, qual = loc
             if kind == "body":
+                body_ok(new_tree, ln, False)
                 m = self.lines_mask(path, neighbours)
                 if not m:
                     # nothing ran next to the insertion: take the whole enclosing function
@@ -546,12 +682,70 @@ class Selector:
                         m = self.range_mask(path, fn.lineno, fn.end_lineno)
                 mask |= m
             elif kind == "lambda":
+                elig = False
                 mask |= self.lines_mask(path, neighbours)
                 if not self._only_lambdas_changed(stmt, old_tree):
                     def_level(stmt, qual, False)
             else:
                 def_level(stmt, qual, False)
+        self._plan_swap = (path, new_text, sorted(swap)) if elig and swap else None
         return mask, import_check
+
+    GROUP = {ast.Is: "eq", ast.Eq: "eq", ast.IsNot: "ne", ast.NotEq: "ne",
+             ast.Lt: "lt", ast.LtE: "lt", ast.Gt: "gt", ast.GtE: "gt"}
+
+    def equivalent_comparisons(self, path, old_tree, new_tree, pairs=None):
+        """True when the only differences are flips between `is` and `==`
+        (or `is not` and `!=`) at comparisons where the two always agreed while
+        the test suite ran, or between `<` and `<=` (`>` and `>=`) at
+        comparisons whose sides were never equal. Profiles come from the build."""
+        if not self.probes or os.environ.get("BR_NO_EQUIV"):
+            return False
+        group = self.GROUP
+
+        class Norm(ast.NodeTransformer):
+            def visit_Compare(self, node):
+                self.generic_visit(node)
+                if len(node.ops) == 1 and type(node.ops[0]) in group:
+                    node.ops = [ast.Eq()] if group[type(node.ops[0])] in ("eq",) else \
+                        [ast.NotEq()] if group[type(node.ops[0])] == "ne" else \
+                        [ast.Lt()] if group[type(node.ops[0])] == "lt" else [ast.Gt()]
+                return node
+
+        if pairs is None:
+            pairs = [(old_tree, new_tree)]
+        try:
+            for x, y in pairs:
+                a = ast.parse(ast.unparse(x))
+                b = ast.parse(ast.unparse(y))
+                if ast_dump(Norm().visit(a)) != ast_dump(Norm().visit(b)):
+                    return False
+        except Exception:  # noqa: BLE001
+            return False
+        flips = 0
+        walk = [pair for x, y in pairs for pair in zip(ast.walk(x), ast.walk(y))]
+        for o, n in walk:
+            if isinstance(o, ast.cmpop) and isinstance(n, ast.cmpop):
+                continue
+            if type(o) is not type(n):
+                return False
+            if not isinstance(o, ast.Compare) or type(o.ops[0]) is type(n.ops[0]):
+                continue
+            if len(o.ops) != 1 or len(n.ops) != 1:
+                return False
+            v = self.probes.get(f"{path}:{o.lineno}:{o.col_offset}")
+            if v is None or not v & 1:
+                return False           # never seen running: no proof either way
+            g = group.get(type(o.ops[0]))
+            if g != group.get(type(n.ops[0])):
+                return False
+            if g in ("eq", "ne"):
+                if v & 2:
+                    return False
+            elif v & 4:
+                return False
+            flips += 1
+        return flips > 0
 
     def _old_function(self, old_tree, qual, stmt):
         target = qual.split(".") if qual else []
@@ -652,17 +846,21 @@ class Selector:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def select(self, patch_text):
+        """Returns (tests, notes, plan). plan["imports"] lists patched sqlglot
+        modules whose top level must still import; plan["swaps"] is set when
+        the change can be checked by swapping function code in a live process."""
         notes = []
+        plan = {"imports": [], "swaps": None}
         try:
             fps = parse_patch(patch_text)
         except Exception as e:  # noqa: BLE001
-            return self.all_numbers, [f"unparsable patch: {e}"]
+            return self.all_numbers, [f"unparsable patch: {e}"], plan
         if not fps:
-            return set(), ["empty patch"]
+            return set(), ["empty patch"], plan
         mask = 0
         everything = False
-        check_imports = []
-        new_texts = {}
+        swaps = []
+        swappable = True
         for fp in fps:
             path = fp.path
             base = path.rsplit("/", 1)[-1]
@@ -673,6 +871,7 @@ class Selector:
             if fp.old is None:
                 # a new file: nothing imports or opens it unless another change does
                 notes.append(f"added {path}")
+                swappable = False
                 continue
             if fp.new is None:
                 notes.append(f"deleted {path}")
@@ -685,17 +884,23 @@ class Selector:
                 continue
             mask |= self.opens.get(path, 0)
             if path.endswith(".py"):
+                self._plan_swap = None
                 m, chk = self.python_change(fp, old_text, notes)
                 if m is None:
                     everything = True
                     continue
                 mask |= m
+                if self._plan_swap is not None:
+                    swaps.append(self._plan_swap)
+                elif "same ast" not in notes[-1:]:
+                    swappable = False
                 if chk:
-                    check_imports.append(fp)
-                    new_texts[path] = apply_hunks(old_text, fp)[0]
+                    if path.startswith("sqlglot/"):
+                        plan["imports"].append((path, apply_hunks(old_text, fp)[0]))
                     if path.startswith("tests/") and path in self.byfile:
                         mask |= self.byfile[path]
             else:
+                swappable = False
                 notes.append(f"data {path}")
                 if path.startswith("tests/") and not self.opens.get(path):
                     # a data file no test opened at runtime: maybe read at import
@@ -705,14 +910,13 @@ class Selector:
                         if stem in t:
                             mask |= tm
         if everything:
-            return self.all_numbers, notes
-        if check_imports and self.import_fails(check_imports, new_texts):
-            notes.append("import fails")
-            return self.all_numbers, notes
+            return self.all_numbers, notes, {"imports": [], "swaps": None}
         chosen = self.mask_to_numbers(mask)
         if chosen:
             chosen |= self.unmapped
-        return chosen, notes
+        if swappable and swaps and not self.unmapped:
+            plan["swaps"] = swaps
+        return chosen, notes, plan
 
 
 # --------------------------------------------------------------------------
@@ -737,26 +941,104 @@ def split(numbers, ms):
     return best[1]
 
 
+def cost_ms(numbers, ms):
+    w = split(numbers, ms)
+    return (max(sum(ms[n] for n in x) for x in w) + WORKER_MS * len(w)) if w else 0
+
+
+VERIFY_WALL_BUDGET = float(os.environ.get("BR_VERIFY_BUDGET", "0"))   # seconds for all local checks
+MAX_LOCAL_TEST_S = 1.5        # never run a test locally whose recorded time is above this
+
+
 def main():
+    started = time.monotonic()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    all_numbers = {t["number"] for t in tests}
     try:
         sel = Selector(tests)
     except Exception as e:  # noqa: BLE001
         log("map failed to load, running everything:", e)
         sel = None
+
+    results = []          # [commit, chosen, plan]
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
         try:
             if sel is None:
                 raise RuntimeError("no map")
-            chosen, notes = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
+            chosen, notes, plan = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
         except Exception as e:  # noqa: BLE001
-            chosen, notes = {t["number"] for t in tests}, [f"error {e!r}"]
+            chosen, notes, plan = set(all_numbers), [f"error {e!r}"], {"imports": [], "swaps": None}
+        results.append([commit, chosen, plan, notes])
+
+    # ---- local checks in a warm process
+    want_imports = any(r[2]["imports"] for r in results)
+    candidates = []
+    if sel is not None:
+        from verify import safe_test
+        for r in results:
+            commit, chosen, plan, _ = r
+            if not plan["swaps"] or not chosen:
+                continue
+            ids = [sel.id_of[n] for n in chosen]
+            if not all(safe_test(i) for i in ids) or any(ms[n] > MAX_LOCAL_TEST_S * 1000 for n in chosen):
+                continue
+            est = sum(ms[n] for n in chosen) * 1.3 / 1000 + 0.15
+            gain = cost_ms(chosen, ms) / 1000
+            if VERIFY_WALL_BUDGET > 0 and est < 0.7 * gain:
+                candidates.append((gain - est, r))
+    warm = None
+    if want_imports or candidates:
+        try:
+            from verify import Warm, modname
+            warm = Warm(SRC)
+            mods = set()
+            for r in results:
+                for path, _ in r[2]["imports"]:
+                    mods.add(modname(path))
+            for _, r in candidates:
+                for path, _, _ in r[2]["swaps"]:
+                    mods.add(modname(path))
+                for n in r[1]:
+                    mods.add(modname(sel.id_of[n].split("::", 1)[0]))
+            if not warm.prepare(mods):
+                warm = None
+        except Exception as e:  # noqa: BLE001
+            log("warm-up failed:", repr(e))
+            warm = None
+
+    for r in results:
+        commit, chosen, plan, notes = r
+        for path, new_src in plan["imports"]:
+            ok = warm.import_ok(path, new_src) if warm is not None else None
+            if ok is None:
+                ok = not sel.import_fails([FilePatch(path, path)], {path: new_src})
+            if not ok:
+                notes.append(f"import fails: {path}")
+                r[1] = set(all_numbers)
+                r[2]["swaps"] = None
+                break
+
+    for _, r in sorted(candidates, key=lambda c: -c[0]):
+        commit, chosen, plan, notes = r
+        if warm is None or not plan["swaps"] or time.monotonic() - started > VERIFY_WALL_BUDGET:
+            continue
+        ids = sorted(sel.id_of[n] for n in chosen)
+        t = time.monotonic()
+        failing = warm.check(plan["swaps"], ids, timeout=max(8.0, 4 * sum(ms[n] for n in chosen) / 1000 + 4))
+        if failing is None:
+            notes.append("check inconclusive")
+            continue
+        num = {sel.id_of[n]: n for n in chosen}
+        r[1] = {num[i] for i in failing}
+        notes.append(f"checked {len(ids)} locally in {time.monotonic() - t:.2f}s: {len(failing)} fail")
+
+    for commit, chosen, plan, notes in results:
         workers = split(chosen, ms)
         log(f"{commit}: {len(chosen)} tests on {len(workers)} workers {notes}")
         sys.stdout.write(json.dumps({"commit": commit, "workers": workers}) + "\n")
-        sys.stdout.flush()
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

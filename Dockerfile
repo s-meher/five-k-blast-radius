@@ -13,5 +13,5 @@ RUN pip install -r /app/requirements.lock
 COPY covplugin.py build_map.py build.sh /app/
 RUN sh /app/build.sh
 
-COPY selector.py /app/selector.py
+COPY selector.py verify.py /app/
 CMD ["python", "/app/selector.py"]

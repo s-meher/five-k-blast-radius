@@ -81,18 +81,40 @@ def eager_modules(root):
             "    f = getattr(m, '__file__', None) or ''\n"
             "    f = os.path.realpath(f)\n"
             "    if f.startswith(r): print(os.path.relpath(f, r))\n")
-    r = subprocess.run([sys.executable, "-c", code, root], capture_output=True, text=True,
-                       env={**__import__("os").environ, "PYTHONPATH": root})
-    return set(r.stdout.split())
+    out = set()
+    for attempt in range(3):
+        r = subprocess.run([sys.executable, "-c", code, root], capture_output=True, text=True,
+                           env={**__import__("os").environ, "PYTHONPATH": root}, cwd="/")
+        out = set(r.stdout.split())
+        if out:
+            return out
+        print(f"eager module scan failed (rc={r.returncode}): {r.stderr[-500:]}", file=sys.stderr)
+    sys.exit("cannot list the modules `import sqlglot` loads")
 
 
-def main(cov_dir, out_path, root):
+# Expensive tests we can check piece by piece inside the container
+# (see verify.py). For these, keep which lines each piece ran.
+PARTED = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+}
+
+
+def main(cov_dir, out_path, root, groups=None):
+    eager = eager_modules(root)
+    paths = glob.glob(f"{cov_dir}/cov-*.json")
+    if groups is not None and len(paths) != groups:
+        sys.exit(f"expected {groups} coverage files, found {len(paths)}: a test group died")
+    collected = 0
     hits = defaultdict(lambda: defaultdict(set))   # key -> file -> lines
     opens = defaultdict(set)                       # key -> files
     inst = defaultdict(set)                        # key -> class names
-    for path in glob.glob(f"{cov_dir}/cov-*.json"):
+    probes = {}                                    # (file, line, col) -> [runs, is_eq_differ, ever_equal]
+    for path in paths:
         with open(path) as fh:
             d = json.load(fh)
+        collected += d.get("collected", 0)
         for k, files in d["hits"].items():
             for f, ls in files.items():
                 hits[k][f].update(ls)
@@ -100,6 +122,11 @@ def main(cov_dir, out_path, root):
             opens[k].update(fs)
         for k, cs in d.get("inst", {}).items():
             inst[k].update(cs)
+        for f, ln, col, runs, differ, equal in d.get("probes", []):
+            r = probes.setdefault((f, ln, col), [0, 0, 0])
+            r[0] += runs
+            r[1] |= differ
+            r[2] |= equal
 
     tests = sorted(k[len("call::"):] for k in hits.keys() | opens.keys() if k.startswith("call::"))
     # tests whose call phase hit nothing still exist; take ids from setup too
@@ -153,8 +180,35 @@ def main(cov_dir, out_path, root):
         for f in files_opened:
             fopens[f] |= mask
 
+    # lines that run while modules are being imported (by sqlglot or by test
+    # modules); a change there cannot be checked by patching a live process
+    importtime = defaultdict(set)
+    for k, files in hits.items():
+        if k.split("::", 1)[0] in ("import", "collect", "boot"):
+            for f, ls in files.items():
+                importtime[f].update(ls)
+
+    parted_bits = {index[t]: t for t in PARTED if t in index}
+    nonpart = {t: defaultdict(set) for t in parted_bits.values()}
+    parts = {t: defaultdict(lambda: defaultdict(set)) for t in parted_bits.values()}
+
+    def note_nonpart(mask, files_lines):
+        for bit, t in parted_bits.items():
+            if mask >> bit & 1:
+                for f, ls in files_lines.items():
+                    nonpart[t][f].update(ls)
+
     for k in hits.keys() | opens.keys() | inst.keys():
         phase, _, name = k.partition("::")
+        if phase in ("sub", "work"):
+            test, _, label = name.partition("##")
+            if test not in index:
+                continue
+            add(1 << index[test], hits.get(k, {}), opens.get(k, ()), inst.get(k, ()))
+            if test in parts:
+                for f, ls in hits.get(k, {}).items():
+                    parts[test][f"{phase}:{label}"][f].update(ls)
+            continue
         if phase == "call" and name in index:
             mask = 1 << index[name]
         elif phase in ("setup", "teardown") and name in index:
@@ -172,12 +226,14 @@ def main(cov_dir, out_path, root):
             continue
         if mask:
             add(mask, hits.get(k, {}), opens.get(k, ()), inst.get(k, ()))
+            note_nonpart(mask, hits.get(k, {}))
 
+    if collected and len(tests) < collected:
+        sys.exit(f"coverage is missing tests: collected {collected}, mapped {len(tests)}")
     if len(tests) < 1000 or len(lines) < 100:
         sys.exit(f"coverage map looks broken: {len(tests)} tests, {len(lines)} files")
     # Code that ran while a sqlglot module was being imported (metaclasses,
     # module-level calls) matters to every test that loads that module.
-    eager = eager_modules(root)
     everyone = (1 << len(tests)) - 1
     def module_users(f):
         """Tests that use module file f at run time: ran its lines or made its classes."""
@@ -211,6 +267,7 @@ def main(cov_dir, out_path, root):
     for k in deferred:
         mask = mask_for_import(k.split("::", 1)[1])
         add(mask, hits.get(k, {}), opens.get(k, ()), inst.get(k, ()))
+        note_nonpart(mask, hits.get(k, {}))
     print(f"eager modules: {len(eager)}, import contexts: {len(deferred)}", file=sys.stderr)
 
     # many lines share a mask: store each mask once and point at it
@@ -230,12 +287,15 @@ def main(cov_dir, out_path, root):
         "opens": dict(fopens),
         "byfile": dict(byfile),
         "classes": dict(classes),
+        "importtime": {f: sorted(ls) for f, ls in importtime.items()},
+        "probes": {f"{f}:{ln}:{col}": (1 if r[0] else 0) | (r[1] << 1) | (r[2] << 2) for (f, ln, col), r in probes.items()},
+
     }
     out["masks"] = table
     with open(out_path, "wb") as fh:
         marshal.dump(out, fh)
-    print(f"map: {len(tests)} tests, {len(out['lines'])} files, {len(fopens)} opened files, {len(classes)} classes", file=sys.stderr)
+    print(f"map: {len(tests)} tests, {len(out['lines'])} files, {len(fopens)} opened files, {len(classes)} classes, {len(probes)} comparison sites", file=sys.stderr)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else None)
