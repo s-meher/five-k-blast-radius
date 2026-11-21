@@ -22,10 +22,7 @@ import json
 import marshal
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -42,7 +39,11 @@ CONFIG_NAMES = {
 
 
 def log(*a):
-    print(*a, file=sys.stderr)
+    try:
+        if sys.stderr is not None:
+            print(*a, file=sys.stderr)
+    except Exception:  # noqa: BLE001  (logging must never break the run)
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -335,21 +336,62 @@ def strip_lambdas(node):
 # --------------------------------------------------------------------------
 # selection
 
+class LazyLines(dict):
+    """file -> {line: mask}, decoded on first use."""
+
+    def __init__(self, raw, masks):
+        super().__init__()
+        self.raw = raw
+        self.masks = masks
+
+    def _load(self, f):
+        blob = self.raw.get(f)
+        if blob is None:
+            return None
+        d = marshal.loads(blob) if isinstance(blob, bytes) else blob
+        if self.masks is not None:
+            d = {ln: self.masks[i] for ln, i in d.items()}
+        dict.__setitem__(self, f, d)
+        return d
+
+    def get(self, f, default=None):
+        if dict.__contains__(self, f):
+            return dict.__getitem__(self, f)
+        d = self._load(f)
+        return default if d is None else d
+
+    def __getitem__(self, f):
+        d = self.get(f)
+        if d is None:
+            raise KeyError(f)
+        return d
+
+    def __contains__(self, f):
+        return f in self.raw
+
+    def __iter__(self):
+        return iter(self.raw)
+
+    def keys(self):
+        return self.raw.keys()
+
+
 class Selector:
     def __init__(self, tests):
         with open(APP / "map.marshal", "rb") as fh:
             m = marshal.load(fh)
+        if m.get("broken"):
+            raise RuntimeError(f"map marked broken at build time: {m['broken']}")
         self.map_tests = m["tests"]
-        masks = m.get("masks")
-        if masks is not None:
-            self.lines = {f: {ln: masks[i] for ln, i in d.items()} for f, d in m["lines"].items()}
-        else:
-            self.lines = m["lines"]
+        self.lines = LazyLines(m["lines"], m.get("masks"))
         self.opens = m["opens"]
         self.byfile = m["byfile"]
         self.classes = m.get("classes", {})
         self.importtime = m.get("importtime", {})
         self.probes = m.get("probes", {})
+        if "aliases" in m:
+            self._alias_idx = m["aliases"]
+            self._chain_idx = m["chains"]
         self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
         self.id_of = {t["number"]: t["id"] for t in tests}
         self.tests = tests
@@ -447,6 +489,17 @@ class Selector:
         return self._walkers
 
     def copiers(self, cls_name, names):
+        idx = self.__dict__.get("_chain_idx")
+        if idx is not None:
+            out = set()
+            for nm in names:
+                for chain, key in idx.get(nm, ()):
+                    if cls_name in chain.split(".")[:-1]:
+                        out.add(key if key else "*")
+            return out
+        return self._copiers_scan(cls_name, names)
+
+    def _copiers_scan(self, cls_name, names):
         """Classes whose bodies read `Cls.attr` at import time (copying a table)."""
         out = set()
         rx = re.compile(r"\b" + re.escape(cls_name) + r"(?:\.\w+)*\.(" + "|".join(map(re.escape, names)) + r")\b") if names else None
@@ -477,6 +530,12 @@ class Selector:
         return out
 
     def def_refs(self, name):
+        idx = self.__dict__.get("_alias_idx")
+        if idx is not None:
+            return set(idx.get(name, ()))
+        return self._def_refs_scan(name)
+
+    def _def_refs_scan(self, name):
         """Classes whose body wires `name` in by plain assignment
         (Generator = TableauGenerator), plus the classes those are nested in."""
         cache = self.__dict__.setdefault("_def_refs", {})
@@ -779,9 +838,14 @@ class Selector:
             return False
         safe_parents = (ast.Dict, ast.List, ast.Tuple, ast.Set, ast.Assign, ast.AnnAssign,
                         ast.Module, ast.UnaryOp)
+        want = bound_names(stmt)
         for n in getattr(other_tree, "body", []):
+            if not (n.lineno - 400 <= stmt.lineno <= n.end_lineno + 400):
+                continue
             for cand in ast.walk(n):
                 if type(cand) is not type(stmt) or getattr(cand, "lineno", None) is None:
+                    continue
+                if abs(cand.lineno - stmt.lineno) > 400 or bound_names(cand) != want:
                     continue
                 try:
                     if ast_dump(Mask().visit(ast.parse(ast.unparse(cand)))) != key:
@@ -802,8 +866,11 @@ class Selector:
             key = strip_lambdas(stmt)
         except Exception:  # noqa: BLE001
             return False
+        want = bound_names(stmt)
         for n in ast.walk(other_tree):
             if isinstance(n, ast.stmt) and type(n) is type(stmt) and getattr(n, "lineno", None):
+                if abs(n.lineno - stmt.lineno) > 400 or bound_names(n) != want:
+                    continue
                 try:
                     if strip_lambdas(n) == key:
                         return True
@@ -823,6 +890,9 @@ class Selector:
                 mods.append(mod)
         if not mods:
             return False
+        import shutil
+        import subprocess
+        import tempfile
         tmp = tempfile.mkdtemp(prefix="br-", dir="/tmp")
         try:
             shutil.copytree(SRC / "sqlglot", Path(tmp) / "sqlglot",

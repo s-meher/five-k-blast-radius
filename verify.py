@@ -32,7 +32,11 @@ UNSAFE_TESTS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
 
 
 def log(*a):
-    print("verify:", *a, file=sys.stderr)
+    try:
+        if sys.stderr is not None:
+            print("verify:", *a, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def modname(path):

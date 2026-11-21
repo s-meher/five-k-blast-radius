@@ -363,10 +363,12 @@ def pytest_make_collect_report(collector):
 
 
 _collected = [0]
+_items = []
 
 
 def pytest_collection_finish(session):
     _collected[0] = len(session.items)
+    _items[:] = [i.nodeid for i in session.items]
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -395,7 +397,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_unconfigure(config):
     mon.set_events(TOOL, 0)
-    out = {"hits": {}, "opens": {}, "collected": _collected[0]}
+    out = {"hits": {}, "opens": {}, "collected": _collected[0], "items": list(_items)}
     for k, s in _hits.items():
         d = {}
         for f, ln in s:

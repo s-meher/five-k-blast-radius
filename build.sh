@@ -29,22 +29,32 @@ REST=$(echo "$ALL" | grep -v -e '^tests/test_executor.py$' -e '^tests/test_parse
 HALF_A=$(for f in $REST; do echo "$(wc -c < $f) $f"; done | sort -rn | awk 'NR%2==1 {print $2}' | tr '\n' ' ')
 HALF_B=$(for f in $REST; do echo "$(wc -c < $f) $f"; done | sort -rn | awk 'NR%2==0 {print $2}' | tr '\n' ' ')
 pids=""
+rm -f /tmp/group.pids /tmp/group.retry
 i=0
 for g in "tests/test_executor.py" "tests/test_parser.py" "tests/test_optimizer.py" "$HALF_A" "$HALF_B"; do
   i=$((i+1))
+  echo "$g" > /tmp/group$i.files
   python -m pytest -q -p covplugin -p no:cacheprovider $g > /tmp/pytest-group$i.log 2>&1 &
-  pids="$pids $!"
+  echo "$! $i" >> /tmp/group.pids
 done
-fail=0
-for p in $pids; do
-  rc=0; wait "$p" || rc=$?
-  # 0: all passed, 1: some tests failed (fine for a map); anything else means pytest broke
-  if [ "$rc" -gt 1 ]; then echo "test group exited with $rc"; fail=1; fi
-done
-if [ "$fail" -ne 0 ]; then tail -n 20 /tmp/pytest-group*.log; exit 1; fi
+# 0: all passed, 1: some tests failed (fine for a map). Anything else means
+# pytest itself broke (killed, crashed): run that group again, alone.
+while read pid n; do
+  rc=0; wait "$pid" || rc=$?
+  if [ "$rc" -gt 1 ]; then echo "group $n exited with $rc; will retry"; echo "$n" >> /tmp/group.retry; fi
+done < /tmp/group.pids
+if [ -f /tmp/group.retry ]; then
+  while read n; do
+    rm -f "$COV"/cov-retry-*.json
+    python -m pytest -q -p covplugin -p no:cacheprovider $(cat /tmp/group$n.files) > /tmp/pytest-group$n.log 2>&1 || true
+  done < /tmp/group.retry
+fi
 tail -n 2 /tmp/pytest-*.log || true
 
-python "$APP/build_map.py" "$COV" "$APP/map.marshal" "$APP/src" "$i"
+python "$APP/build_map.py" "$COV" "$APP/map.marshal" "$APP/src" "$i" || {
+  # the map could not be built at all: ship a map that makes the selector run everything
+  python -c "import marshal; marshal.dump({'broken': ['build_map failed']}, open('$APP/map.marshal', 'wb'))"
+}
 rm -rf "$COV"
 find "$APP/src" -name '__pycache__' -prune -exec rm -rf {} +
 chmod -R a+rX "$APP"

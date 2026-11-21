@@ -73,6 +73,61 @@ def import_graph(root):
     return graph
 
 
+def class_indexes(root):
+    """Import-time wiring between classes, from the pinned source:
+      aliases: name -> class keys whose body assigns that name plainly
+               (Generator = TableauGenerator), with the classes they sit in
+      chains:  attr -> [(dotted chain, class key or "")] for class/module
+               bodies reading Some.Class.attr at import time"""
+    import ast
+    import os
+    aliases, chains = defaultdict(set), defaultdict(set)
+    for dp, _, fs in os.walk(os.path.join(root, "sqlglot")):
+        for f in fs:
+            if not f.endswith(".py"):
+                continue
+            path = os.path.relpath(os.path.join(dp, f), root)
+            module = path[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[: -len(".__init__")]
+            try:
+                tree = ast.parse(open(os.path.join(root, path), "rb").read())
+            except SyntaxError:
+                continue
+
+            def visit(stmts, qual):
+                for st in stmts:
+                    if isinstance(st, ast.ClassDef):
+                        visit(st.body, qual + [st.name])
+                        continue
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    keys = [f"{module}." + ".".join(qual[:j]) for j in range(1, len(qual) + 1)]
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)) and qual:
+                        v = st.value
+                        if isinstance(v, ast.Name):
+                            aliases[v.id].update(keys)
+                        elif isinstance(v, ast.Attribute):
+                            aliases[v.attr].update(keys)
+                    for n in ast.walk(st):
+                        if isinstance(n, ast.Lambda):
+                            continue
+                        if isinstance(n, ast.Attribute):
+                            parts = []
+                            x = n
+                            while isinstance(x, ast.Attribute):
+                                parts.append(x.attr)
+                                x = x.value
+                            if isinstance(x, ast.Name):
+                                parts.append(x.id)
+                                chain = ".".join(reversed(parts))
+                                chains[n.attr].add((chain, f"{module}." + ".".join(qual) if qual else ""))
+
+            visit(tree.body, [])
+    return ({k: sorted(v) for k, v in aliases.items()},
+            {k: sorted(v) for k, v in chains.items()})
+
+
 def eager_modules(root):
     import subprocess
     code = ("import sys, sqlglot, os\n"
@@ -89,7 +144,8 @@ def eager_modules(root):
         if out:
             return out
         print(f"eager module scan failed (rc={r.returncode}): {r.stderr[-500:]}", file=sys.stderr)
-    sys.exit("cannot list the modules `import sqlglot` loads")
+    print("cannot list the modules `import sqlglot` loads; treating every import as global", file=sys.stderr)
+    return None
 
 
 # Expensive tests we can check piece by piece inside the container
@@ -103,10 +159,13 @@ PARTED = {
 
 def main(cov_dir, out_path, root, groups=None):
     eager = eager_modules(root)
+    aliases_idx, chains_idx = class_indexes(root)
     paths = glob.glob(f"{cov_dir}/cov-*.json")
-    if groups is not None and len(paths) != groups:
-        sys.exit(f"expected {groups} coverage files, found {len(paths)}: a test group died")
+    broken = []
+    if groups is not None and len(paths) < groups:
+        broken.append(f"expected {groups} coverage files, found {len(paths)}")
     collected = 0
+    items = set()
     hits = defaultdict(lambda: defaultdict(set))   # key -> file -> lines
     opens = defaultdict(set)                       # key -> files
     inst = defaultdict(set)                        # key -> class names
@@ -115,6 +174,7 @@ def main(cov_dir, out_path, root, groups=None):
         with open(path) as fh:
             d = json.load(fh)
         collected += d.get("collected", 0)
+        items.update(d.get("items", ()))
         for k, files in d["hits"].items():
             for f, ls in files.items():
                 hits[k][f].update(ls)
@@ -130,7 +190,8 @@ def main(cov_dir, out_path, root, groups=None):
 
     tests = sorted(k[len("call::"):] for k in hits.keys() | opens.keys() if k.startswith("call::"))
     # tests whose call phase hit nothing still exist; take ids from setup too
-    tests = sorted(set(tests) | {k[len("setup::"):] for k in hits.keys() | opens.keys() if k.startswith("setup::")})
+    tests = sorted(set(tests) | {k[len("setup::"):] for k in hits.keys() | opens.keys() if k.startswith("setup::")}
+                   | items)   # tests skipped before running any code still exist
     index = {t: i for i, t in enumerate(tests)}
 
     def group(t):          # class (or module) a test belongs to
@@ -229,9 +290,12 @@ def main(cov_dir, out_path, root, groups=None):
             note_nonpart(mask, hits.get(k, {}))
 
     if collected and len(tests) < collected:
-        sys.exit(f"coverage is missing tests: collected {collected}, mapped {len(tests)}")
+        broken.append(f"collected {collected} tests, mapped {len(tests)}")
     if len(tests) < 1000 or len(lines) < 100:
-        sys.exit(f"coverage map looks broken: {len(tests)} tests, {len(lines)} files")
+        broken.append(f"only {len(tests)} tests, {len(lines)} files")
+    if broken:
+        # never fail the build: a broken map makes the selector run everything
+        print("MAP BROKEN, selector will run every test:", broken, file=sys.stderr)
     # Code that ran while a sqlglot module was being imported (metaclasses,
     # module-level calls) matters to every test that loads that module.
     everyone = (1 << len(tests)) - 1
@@ -253,7 +317,7 @@ def main(cov_dir, out_path, root, groups=None):
     def mask_for_import(mod_file):
         if mod_file in import_mask:
             return import_mask[mod_file]
-        if mod_file in eager:
+        if eager is None or mod_file in eager:
             m = everyone
         else:
             m = 0
@@ -283,15 +347,20 @@ def main(cov_dir, out_path, root, groups=None):
     out = {
         "tests": tests,
         "masks": None,
-        "lines": {f: {ln: ref(v) for ln, v in d.items()} for f, d in lines.items()},
+        # each file's line table is marshalled separately so the selector
+        # only decodes the files a change touches
+        "lines": {f: marshal.dumps({ln: ref(v) for ln, v in d.items()}) for f, d in lines.items()},
         "opens": dict(fopens),
         "byfile": dict(byfile),
         "classes": dict(classes),
         "importtime": {f: sorted(ls) for f, ls in importtime.items()},
+        "aliases": aliases_idx,
+        "chains": chains_idx,
         "probes": {f"{f}:{ln}:{col}": (1 if r[0] else 0) | (r[1] << 1) | (r[2] << 2) for (f, ln, col), r in probes.items()},
 
     }
     out["masks"] = table
+    out["broken"] = broken
     with open(out_path, "wb") as fh:
         marshal.dump(out, fh)
     print(f"map: {len(tests)} tests, {len(out['lines'])} files, {len(fopens)} opened files, {len(classes)} classes, {len(probes)} comparison sites", file=sys.stderr)
